@@ -2,8 +2,8 @@ use {
     async_trait::async_trait,
     carbon_core::{
         datasource::{
-            AccountUpdate, BlockDetails, Datasource, DatasourceDisconnection, DatasourceId,
-            TransactionUpdate, Update, UpdateType,
+            AccountUpdate, Datasource, DatasourceDisconnection, DatasourceId, TransactionUpdate,
+            Update, UpdateType,
         },
         error::CarbonResult,
         metrics::{Counter, Histogram, MetricsRegistry},
@@ -18,7 +18,7 @@ use {
         collections::HashMap,
         convert::TryFrom,
         sync::{Arc, LazyLock},
-        time::{Duration, SystemTime},
+        time::Duration,
     },
     tokio::sync::{mpsc, mpsc::Sender},
     tokio_util::sync::CancellationToken,
@@ -95,21 +95,6 @@ static TRANSACTION_UPDATES_RECEIVED: Counter = Counter::new(
     "yellowstone_grpc_transaction_updates_received_total",
     "Total transaction updates received from Yellowstone gRPC",
 );
-static BLOCK_META_PROCESS_TIME_NANOS: LazyLock<Histogram> = LazyLock::new(|| {
-    Histogram::new(
-        "yellowstone_grpc_block_meta_process_time_nanoseconds",
-        "Time taken to process block meta updates in nanoseconds",
-        vec![
-            1_000.0,
-            10_000.0,
-            100_000.0,
-            1_000_000.0,
-            10_000_000.0,
-            100_000_000.0,
-            1_000_000_000.0,
-        ],
-    )
-});
 static BLOCK_META_UPDATES_RECEIVED: Counter = Counter::new(
     "yellowstone_grpc_block_meta_updates_received_total",
     "Total block meta updates received from Yellowstone gRPC",
@@ -124,7 +109,6 @@ fn register_yellowstone_metrics() {
     registry.register_histogram(&ACCOUNT_DELETION_PROCESS_TIME_NANOS);
     registry.register_histogram(&TRANSACTION_PROCESS_TIME_NANOS);
     registry.register_counter(&BLOCK_META_UPDATES_RECEIVED);
-    registry.register_histogram(&BLOCK_META_PROCESS_TIME_NANOS);
 }
 
 /// Default timeout for detecting stale connections (30 seconds)
@@ -145,8 +129,9 @@ const DEFAULT_TAG: &str = "yellowstone-grpc";
 
 /// Returns the block time for a slot, if already known (e.g. from blocks_meta).
 pub type BlockTimeResolver = Arc<dyn Fn(u64) -> Option<i64> + Send + Sync>;
-/// Called with `(slot, block_time)` for every blocks_meta update that has a block time.
-pub type BlockMetaObserver = Arc<dyn Fn(u64, i64) + Send + Sync>;
+/// Called with every blocks_meta update as soon as it is received, before
+/// any pipeline queueing, so receive-time measurements stay accurate.
+pub type BlockMetaObserver = Arc<dyn Fn(&SubscribeUpdateBlockMeta) + Send + Sync>;
 
 /// Per-transaction delivery timing, for provider latency telemetry.
 #[derive(Debug, Clone)]
@@ -176,8 +161,6 @@ pub struct YellowstoneGrpcGeyserClient {
     pub block_time_resolver: Option<BlockTimeResolver>,
     pub block_meta_observer: Option<BlockMetaObserver>,
     pub transaction_timing_observer: Option<TransactionTimingObserver>,
-    /// Forward blocks_meta updates to the pipeline as `Update::BlockDetails`.
-    pub emit_block_details: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -250,7 +233,6 @@ impl YellowstoneGrpcGeyserClient {
             block_time_resolver: None,
             block_meta_observer: None,
             transaction_timing_observer: None,
-            emit_block_details: false,
         }
     }
 
@@ -281,11 +263,6 @@ impl YellowstoneGrpcGeyserClient {
 
     pub fn with_transaction_timing_observer(mut self, observer: TransactionTimingObserver) -> Self {
         self.transaction_timing_observer = Some(observer);
-        self
-    }
-
-    pub fn with_block_details_updates(mut self) -> Self {
-        self.emit_block_details = true;
         self
     }
 }
@@ -412,7 +389,6 @@ impl Datasource for YellowstoneGrpcGeyserClient {
         let block_time_resolver = self.block_time_resolver.clone();
         let block_meta_observer = self.block_meta_observer.clone();
         let tx_timing_observer = self.transaction_timing_observer.clone();
-        let emit_block_details = self.emit_block_details;
 
         tokio::spawn(async move {
             let subscribe_request = SubscribeRequest {
@@ -584,12 +560,9 @@ impl Datasource for YellowstoneGrpcGeyserClient {
 
                                             Some(UpdateOneof::BlockMeta(block_meta)) => {
                                                 last_processed_slot = block_meta.slot;
-                                                let block_time = block_meta.block_time.as_ref().map(|ts| ts.timestamp);
-                                                if let (Some(observer), Some(block_time)) = (&block_meta_observer, block_time) {
-                                                    observer(block_meta.slot, block_time);
-                                                }
-                                                if emit_block_details {
-                                                    send_subscribe_update_block_meta(block_meta, &sender, id_for_loop.clone(), &tag).await
+                                                BLOCK_META_UPDATES_RECEIVED.inc();
+                                                if let Some(observer) = &block_meta_observer {
+                                                    observer(&block_meta);
                                                 }
                                             }
 
@@ -664,9 +637,6 @@ impl Datasource for YellowstoneGrpcGeyserClient {
         if !self.transaction_filters.is_empty() || has_block_filters {
             update_types.push(UpdateType::Transaction);
         }
-        if self.emit_block_details {
-            update_types.push(UpdateType::BlockDetails);
-        }
         update_types
     }
 }
@@ -698,55 +668,6 @@ fn yellowstone_ready_component(tag: &str) -> &'static str {
     } else {
         "yellowstone_confirmed"
     }
-}
-
-pub fn block_details_from_subscribe_update_block_meta(
-    block_meta: SubscribeUpdateBlockMeta,
-    observed_at_ms: u64,
-) -> BlockDetails {
-    BlockDetails {
-        slot: block_meta.slot,
-        block_hash: block_meta.blockhash.parse().ok(),
-        previous_block_hash: block_meta.parent_blockhash.parse().ok(),
-        rewards: None,
-        num_reward_partitions: None,
-        block_time: block_meta.block_time.map(|ts| ts.timestamp),
-        block_height: block_meta.block_height.map(|height| height.block_height),
-        observed_at_ms: Some(observed_at_ms),
-    }
-}
-
-async fn send_subscribe_update_block_meta(
-    block_meta: SubscribeUpdateBlockMeta,
-    sender: &Sender<(Update, DatasourceId)>,
-    id: DatasourceId,
-    tag: &str,
-) {
-    let start_time = std::time::Instant::now();
-    let slot = block_meta.slot;
-    let block_details =
-        block_details_from_subscribe_update_block_meta(block_meta, system_unix_ms());
-
-    if block_details.block_hash.is_none() {
-        log::warn!("[{tag}] Forwarding block meta with invalid blockhash at slot {slot}");
-    }
-    if block_details.previous_block_hash.is_none() {
-        log::warn!("[{tag}] Forwarding block meta with invalid parent blockhash at slot {slot}");
-    }
-
-    if let Err(e) = sender.try_send((Update::BlockDetails(block_details), id)) {
-        log::error!("[{tag}] Failed to send block meta update at slot {slot}: {e:?}");
-        return;
-    }
-
-    BLOCK_META_PROCESS_TIME_NANOS.record(start_time.elapsed().as_nanos() as f64);
-    BLOCK_META_UPDATES_RECEIVED.inc();
-}
-
-fn system_unix_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_millis() as u64)
 }
 
 async fn send_subscribe_account_update_info(
