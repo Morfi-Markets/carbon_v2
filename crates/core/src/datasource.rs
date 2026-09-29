@@ -181,6 +181,9 @@ pub struct BlockDetails {
     pub num_reward_partitions: Option<u64>,
     pub block_time: Option<i64>,
     pub block_height: Option<u64>,
+    /// Local Unix milliseconds when the datasource received this block
+    /// metadata, for sources that stream it live.
+    pub observed_at_ms: Option<u64>,
 }
 
 #[cfg(test)]

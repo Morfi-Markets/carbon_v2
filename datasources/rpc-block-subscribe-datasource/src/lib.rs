@@ -275,6 +275,7 @@ impl Datasource for RpcBlockSubscribe {
                                                 num_reward_partitions: block.num_reward_partitions,
                                                 block_time: block.block_time,
                                                 block_height: block.block_height,
+                                                observed_at_ms: None,
                                     });
 
                                     if let Err(err) = sender_clone.try_send((block_deteils, id_for_loop.clone())) {

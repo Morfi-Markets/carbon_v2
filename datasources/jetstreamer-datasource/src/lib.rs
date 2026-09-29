@@ -231,6 +231,7 @@ impl JetstreamerDatasource {
                     num_reward_partitions: rewards.num_partitions,
                     block_time,
                     block_height,
+                    observed_at_ms: None,
                 }),
                 id,
             ))
