@@ -724,8 +724,12 @@ mod tests {
 
         assert_eq!(extract(vec![None]).len(), 1);
         assert_eq!(extract(vec![Some(1)]).len(), 1);
-        assert_eq!(extract(vec![Some(6)]).len(), 1);
+        assert_eq!(extract(vec![Some(10)]).len(), 1);
         assert_eq!(extract(vec![Some(2)]).len(), 2);
+
+        let deepest = extract((2..=9).map(Some).collect());
+        assert_eq!(deepest.len(), 9);
+        assert_eq!(deepest[8].0.absolute_path, vec![0; 9]);
 
         let partial = extract(vec![Some(2), None, Some(2)]);
         assert_eq!(partial.len(), 2);
