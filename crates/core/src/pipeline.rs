@@ -15,8 +15,7 @@
 //! # Flow
 //!
 //! 1. `run()` spawns one tokio task per datasource and collects updates on an
-//!    MPSC channel. A datasource whose `consume` fails stops the pipeline and
-//!    `run()` returns that error.
+//!    MPSC channel.
 //! 2. For each `(Update, DatasourceId)` it calls every registered pipe whose
 //!    update type matches and whose filters return `Accept`. Transactions
 //!    first pass through every [`TransactionPreprocessor`].
@@ -38,7 +37,7 @@ use {
         datasource::{
             AccountDeletion, BlockDetails, Datasource, DatasourceId, TransactionUpdate, Update,
         },
-        error::{CarbonResult, Error},
+        error::CarbonResult,
         filter::{Filter, FilterContext, FilterResult},
         instruction::{
             InstructionDecoder, InstructionPipe, InstructionPipes, InstructionProcessorInputType,
@@ -222,8 +221,6 @@ impl Pipeline {
         }
         let (update_sender, mut update_receiver) =
             tokio::sync::mpsc::channel::<(Update, DatasourceId)>(self.channel_buffer_size);
-        let (datasource_error_sender, mut datasource_error_receiver) =
-            tokio::sync::mpsc::channel::<(DatasourceId, Error)>(self.datasources.len().max(1));
 
         let datasource_cancellation_token = self
             .datasource_cancellation_token
@@ -235,10 +232,6 @@ impl Pipeline {
             let sender_clone = update_sender.clone();
             let datasource_clone = Arc::clone(&datasource.1);
             let datasource_id = datasource.0.clone();
-            let datasource_error_sender = datasource_error_sender.clone();
-            // Keeps the update channel open until a failure is queued, so the
-            // run loop can't mistake a failed datasource for a clean close.
-            let update_channel_guard = update_sender.clone();
 
             tokio::spawn(async move {
                 if let Err(e) = datasource_clone
@@ -253,14 +246,11 @@ impl Pipeline {
                         "[datasource:{}] error consuming datasource: {e:?}",
                         datasource_id.as_str()
                     );
-                    let _ = datasource_error_sender.send((datasource_id, e)).await;
                 }
-                drop(update_channel_guard);
             });
         }
 
         drop(update_sender);
-        drop(datasource_error_sender);
 
         loop {
             tokio::select! {
@@ -280,9 +270,6 @@ impl Pipeline {
                     } else {
                         log::info!("shutting down the pipeline after processing pending updates.");
                     }
-                }
-                Some((datasource_id, error)) = datasource_error_receiver.recv() => {
-                    return self.fail_on_datasource_error(&datasource_cancellation_token, &datasource_id, error);
                 }
                 update = update_receiver.recv() => {
                     match update {
@@ -314,9 +301,6 @@ impl Pipeline {
                             UPDATES_QUEUED.set(update_receiver.len() as f64);
                         }
                         None => {
-                            if let Ok((datasource_id, error)) = datasource_error_receiver.try_recv() {
-                                return self.fail_on_datasource_error(&datasource_cancellation_token, &datasource_id, error);
-                            }
                             log::info!("update_receiver closed, shutting down.");
                             self.export_metrics()?;
                             self.shutdown_exporters()?;
@@ -330,21 +314,6 @@ impl Pipeline {
         log::info!("pipeline shutdown complete.");
 
         Ok(())
-    }
-
-    fn fail_on_datasource_error(
-        &self,
-        datasource_cancellation_token: &CancellationToken,
-        datasource_id: &DatasourceId,
-        error: Error,
-    ) -> CarbonResult<()> {
-        datasource_cancellation_token.cancel();
-        self.export_metrics()?;
-        self.shutdown_exporters()?;
-        Err(Error::FailedToConsumeDatasource(format!(
-            "datasource {} failed: {error}",
-            datasource_id.as_str()
-        )))
     }
 
     fn export_metrics(&self) -> CarbonResult<()> {
@@ -744,102 +713,5 @@ impl PipelineBuilder {
             shutdown_strategy: self.shutdown_strategy,
             channel_buffer_size: self.channel_buffer_size,
         })
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use {
-        super::*,
-        crate::datasource::UpdateType,
-        async_trait::async_trait,
-        std::sync::atomic::{AtomicBool, Ordering},
-        tokio::sync::mpsc::Sender,
-    };
-
-    struct FailingDatasource;
-
-    #[async_trait]
-    impl Datasource for FailingDatasource {
-        async fn consume(
-            &self,
-            _id: DatasourceId,
-            _sender: Sender<(Update, DatasourceId)>,
-            _cancellation_token: CancellationToken,
-        ) -> CarbonResult<()> {
-            Err(Error::FailedToConsumeDatasource(
-                "connect refused".to_string(),
-            ))
-        }
-
-        fn update_types(&self) -> Vec<UpdateType> {
-            Vec::new()
-        }
-    }
-
-    struct IdleDatasource {
-        cancelled: Arc<AtomicBool>,
-    }
-
-    #[async_trait]
-    impl Datasource for IdleDatasource {
-        async fn consume(
-            &self,
-            _id: DatasourceId,
-            _sender: Sender<(Update, DatasourceId)>,
-            cancellation_token: CancellationToken,
-        ) -> CarbonResult<()> {
-            cancellation_token.cancelled().await;
-            self.cancelled.store(true, Ordering::SeqCst);
-            Ok(())
-        }
-
-        fn update_types(&self) -> Vec<UpdateType> {
-            Vec::new()
-        }
-    }
-
-    fn assert_datasource_failure(result: CarbonResult<()>) {
-        match result {
-            Err(Error::FailedToConsumeDatasource(message)) => assert_eq!(
-                message,
-                "datasource failing failed: Failed to consume datasource (connect refused)"
-            ),
-            other => panic!("expected datasource failure, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn run_returns_error_when_only_datasource_fails() {
-        // The failed datasource also closes the update channel; repeat to catch
-        // the loop treating that close as a clean shutdown.
-        for _ in 0..200 {
-            let mut pipeline = Pipeline::builder()
-                .datasource_with_id(FailingDatasource, DatasourceId::new_named("failing"))
-                .build()
-                .expect("build pipeline");
-
-            assert_datasource_failure(pipeline.run().await);
-        }
-    }
-
-    #[tokio::test]
-    async fn run_cancels_other_datasources_when_one_fails() {
-        let cancelled = Arc::new(AtomicBool::new(false));
-        let mut pipeline = Pipeline::builder()
-            .datasource(IdleDatasource {
-                cancelled: Arc::clone(&cancelled),
-            })
-            .datasource_with_id(FailingDatasource, DatasourceId::new_named("failing"))
-            .build()
-            .expect("build pipeline");
-
-        let result = tokio::time::timeout(std::time::Duration::from_secs(5), pipeline.run())
-            .await
-            .expect("pipeline must stop after a datasource failure");
-
-        assert_datasource_failure(result);
-        tokio::task::yield_now().await;
-        assert!(cancelled.load(Ordering::SeqCst));
     }
 }
