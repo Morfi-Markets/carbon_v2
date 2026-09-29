@@ -75,6 +75,10 @@ impl DatasourceId {
     pub fn new_named(name: &str) -> Self {
         Self(name.to_string())
     }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 /// Unified payload emitted by datasources into the pipeline.
