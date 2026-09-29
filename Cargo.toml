@@ -211,6 +211,7 @@ tokio-retry = "0.3.0"
 tokio-util = "0.7.17"
 tonic = { version = "0.13.1", features = ["tls-native-roots", "tls-webpki-roots"] }
 tonic-build = "0.13.1"
+tracing = "0.1.44"
 unicode-xid = "0.2"
 uuid = { version = "1.18.1", features = ["serde", "v7"] }
 wincode = "0.5.5"
