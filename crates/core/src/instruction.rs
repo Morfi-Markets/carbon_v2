@@ -16,7 +16,7 @@
 //!   nested tree without reallocating mid-build (uses raw pointers under the
 //!   hood; safety invariants documented inline).
 //! - [`MAX_INSTRUCTION_STACK_DEPTH`] — Solana's per-transaction CPI depth
-//!   ceiling (9, per SIMD-0268).
+//!   ceiling (5).
 
 use {
     crate::{
@@ -54,11 +54,8 @@ const PRECOMPILE_PROGRAMS: &[&str] = &[
     "Secp256r1SigVerify1111111111111111111111111",
 ];
 
-// Mirrors agave's MAX_INSTRUCTION_STACK_DEPTH_SIMD_0268 = 9
-// (1 outer + 8 nested CPIs). SIMD-0268 raises the limit from the prior 5;
-// see https://github.com/solana-foundation/solana-improvement-documents/blob/main/proposals/0268-raise-cpi-nesting-limit.md
-// and https://github.com/anza-xyz/agave/blob/master/program-runtime/src/execution_budget.rs
-pub const MAX_INSTRUCTION_STACK_DEPTH: usize = 9;
+// https://github.com/anza-xyz/agave/blob/master/program-runtime/src/execution_budget.rs#L7
+pub const MAX_INSTRUCTION_STACK_DEPTH: usize = 5;
 
 impl InstructionMetadata {
     pub fn decode_log_events<T: CarbonDeserialize>(&self) -> Vec<T> {
