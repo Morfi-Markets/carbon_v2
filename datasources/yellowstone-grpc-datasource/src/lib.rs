@@ -34,6 +34,7 @@ use {
             SubscribeRequestPing, SubscribeUpdateAccountInfo, SubscribeUpdateBlockMeta,
             SubscribeUpdateTransactionInfo,
         },
+        prost_types::Timestamp,
         tonic::{codec::CompressionEncoding, transport::ClientTlsConfig, Status},
     },
 };
@@ -130,8 +131,11 @@ const DEFAULT_TAG: &str = "yellowstone-grpc";
 /// Returns the block time for a slot, if already known (e.g. from blocks_meta).
 pub type BlockTimeResolver = Arc<dyn Fn(u64) -> Option<i64> + Send + Sync>;
 /// Called with every blocks_meta update as soon as it is received, before
-/// any pipeline queueing, so receive-time measurements stay accurate.
-pub type BlockMetaObserver = Arc<dyn Fn(&SubscribeUpdateBlockMeta) + Send + Sync>;
+/// any pipeline queueing, so receive-time measurements stay accurate. The
+/// second argument is the provider's `SubscribeUpdate.created_at`: set on the
+/// provider's clock, and not guaranteed to be populated by every provider.
+pub type BlockMetaObserver =
+    Arc<dyn Fn(&SubscribeUpdateBlockMeta, Option<&Timestamp>) + Send + Sync>;
 
 /// Per-transaction delivery timing, for provider latency telemetry.
 #[derive(Debug, Clone)]
@@ -562,7 +566,7 @@ impl Datasource for YellowstoneGrpcGeyserClient {
                                                 last_processed_slot = block_meta.slot;
                                                 BLOCK_META_UPDATES_RECEIVED.inc();
                                                 if let Some(observer) = &block_meta_observer {
-                                                    observer(&block_meta);
+                                                    observer(&block_meta, msg.created_at.as_ref());
                                                 }
                                             }
 
