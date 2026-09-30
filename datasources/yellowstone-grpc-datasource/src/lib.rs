@@ -14,20 +14,28 @@ use {
     solana_account::Account,
     solana_pubkey::Pubkey,
     solana_signature::Signature,
-    std::{collections::HashMap, convert::TryFrom, sync::LazyLock, time::Duration},
+    std::{
+        collections::HashMap,
+        convert::TryFrom,
+        sync::{Arc, LazyLock},
+        time::Duration,
+    },
     tokio::sync::{mpsc, mpsc::Sender},
     tokio_util::sync::CancellationToken,
     yellowstone_grpc_client::{
-        GeyserGrpcBuilder, GeyserGrpcBuilderResult, GeyserGrpcClient, ReconnectConfig,
+        GeyserGrpcBuilder, GeyserGrpcBuilderResult, GeyserGrpcClient, GeyserGrpcClientError,
+        GeyserGrpcClientResult, GeyserStream, ReconnectConfig, SubscribeRequestSink,
     },
     yellowstone_grpc_proto::{
         geyser::{
             subscribe_update::UpdateOneof, CommitmentLevel, SubscribeRequest,
             SubscribeRequestFilterAccounts, SubscribeRequestFilterBlocks,
-            SubscribeRequestFilterTransactions, SubscribeRequestPing, SubscribeUpdateAccountInfo,
+            SubscribeRequestFilterBlocksMeta, SubscribeRequestFilterTransactions,
+            SubscribeRequestPing, SubscribeUpdateAccountInfo, SubscribeUpdateBlockMeta,
             SubscribeUpdateTransactionInfo,
         },
-        tonic::{codec::CompressionEncoding, transport::ClientTlsConfig},
+        prost_types::Timestamp,
+        tonic::{codec::CompressionEncoding, transport::ClientTlsConfig, Status},
     },
 };
 
@@ -88,6 +96,10 @@ static TRANSACTION_UPDATES_RECEIVED: Counter = Counter::new(
     "yellowstone_grpc_transaction_updates_received_total",
     "Total transaction updates received from Yellowstone gRPC",
 );
+static BLOCK_META_UPDATES_RECEIVED: Counter = Counter::new(
+    "yellowstone_grpc_block_meta_updates_received_total",
+    "Total block meta updates received from Yellowstone gRPC",
+);
 
 fn register_yellowstone_metrics() {
     let registry = MetricsRegistry::global();
@@ -97,6 +109,7 @@ fn register_yellowstone_metrics() {
     registry.register_histogram(&ACCOUNT_PROCESS_TIME_NANOS);
     registry.register_histogram(&ACCOUNT_DELETION_PROCESS_TIME_NANOS);
     registry.register_histogram(&TRANSACTION_PROCESS_TIME_NANOS);
+    registry.register_counter(&BLOCK_META_UPDATES_RECEIVED);
 }
 
 /// Default timeout for detecting stale connections (30 seconds)
@@ -108,7 +121,33 @@ const RECONNECT_INITIAL_DELAY_MS: u64 = 100;
 /// Upper bound on the retry delay
 const RECONNECT_MAX_DELAY_MS: u64 = 3_000;
 
-#[derive(Debug)]
+/// A subscribe call can hang without erroring; retry it after this long.
+const SUBSCRIBE_DEADLINE: Duration = Duration::from_secs(15);
+
+/// Log/disconnect source label when no tag is set. Deliberately not the
+/// endpoint, which may carry credentials.
+const DEFAULT_TAG: &str = "yellowstone-grpc";
+
+/// Returns the block time for a slot, if already known (e.g. from blocks_meta).
+pub type BlockTimeResolver = Arc<dyn Fn(u64) -> Option<i64> + Send + Sync>;
+/// Called with every blocks_meta update as soon as it is received, before
+/// any pipeline queueing, so receive-time measurements stay accurate. The
+/// second argument is the provider's `SubscribeUpdate.created_at`: set on the
+/// provider's clock, and not guaranteed to be populated by every provider.
+pub type BlockMetaObserver =
+    Arc<dyn Fn(&SubscribeUpdateBlockMeta, Option<&Timestamp>) + Send + Sync>;
+
+/// Per-transaction delivery timing, for provider latency telemetry.
+#[derive(Debug, Clone)]
+pub struct TransactionTiming {
+    pub slot: u64,
+    pub block_time: Option<i64>,
+    /// Provider-side `SubscribeUpdate.created_at`, Unix seconds.
+    pub provider_created_at: Option<i64>,
+}
+
+pub type TransactionTimingObserver = Arc<dyn Fn(&TransactionTiming) + Send + Sync>;
+
 pub struct YellowstoneGrpcGeyserClient {
     pub endpoint: String,
     pub x_token: Option<String>,
@@ -120,6 +159,12 @@ pub struct YellowstoneGrpcGeyserClient {
     pub disconnect_notifier: Option<mpsc::Sender<DatasourceDisconnection>>,
     /// Timeout for detecting hung/stale connections. Default: 30 seconds.
     pub stream_timeout: Duration,
+    pub blocks_meta_filters: HashMap<String, SubscribeRequestFilterBlocksMeta>,
+    /// Label for logs, readiness events, and disconnect notifications.
+    pub tag: Option<String>,
+    pub block_time_resolver: Option<BlockTimeResolver>,
+    pub block_meta_observer: Option<BlockMetaObserver>,
+    pub transaction_timing_observer: Option<TransactionTimingObserver>,
 }
 
 #[derive(Debug, Clone)]
@@ -133,6 +178,9 @@ pub struct YellowstoneGrpcClientConfig {
     /// When set, the client reconnects and replays inside the stream instead of
     /// surfacing the disconnect. Off by default.
     pub reconnect: Option<ReconnectConfig>,
+    pub http2_adaptive_window: Option<bool>,
+    pub http2_keep_alive_interval: Option<Duration>,
+    pub keep_alive_while_idle: Option<bool>,
 }
 
 impl Default for YellowstoneGrpcClientConfig {
@@ -145,6 +193,9 @@ impl Default for YellowstoneGrpcClientConfig {
             tls_config: None,
             tcp_nodelay: None,
             reconnect: None,
+            http2_adaptive_window: None,
+            http2_keep_alive_interval: None,
+            keep_alive_while_idle: None,
         }
     }
 }
@@ -181,7 +232,42 @@ impl YellowstoneGrpcGeyserClient {
             disconnect_notifier,
             stream_timeout: stream_timeout
                 .unwrap_or(Duration::from_secs(DEFAULT_STREAM_TIMEOUT_SECS)),
+            blocks_meta_filters: HashMap::new(),
+            tag: None,
+            block_time_resolver: None,
+            block_meta_observer: None,
+            transaction_timing_observer: None,
         }
+    }
+
+    pub fn with_tag(mut self, tag: impl Into<String>) -> Self {
+        self.tag = Some(tag.into());
+        self
+    }
+
+    pub fn with_blocks_meta_filters(
+        mut self,
+        blocks_meta_filters: HashMap<String, SubscribeRequestFilterBlocksMeta>,
+    ) -> Self {
+        self.blocks_meta_filters = blocks_meta_filters;
+        self
+    }
+
+    /// Fills `TransactionUpdate::block_time` for streamed transactions, which
+    /// Yellowstone does not carry.
+    pub fn with_block_time_resolver(mut self, resolver: BlockTimeResolver) -> Self {
+        self.block_time_resolver = Some(resolver);
+        self
+    }
+
+    pub fn with_block_meta_observer(mut self, observer: BlockMetaObserver) -> Self {
+        self.block_meta_observer = Some(observer);
+        self
+    }
+
+    pub fn with_transaction_timing_observer(mut self, observer: TransactionTimingObserver) -> Self {
+        self.transaction_timing_observer = Some(observer);
+        self
     }
 }
 
@@ -202,6 +288,9 @@ impl YellowstoneGrpcClientConfig {
             tls_config,
             tcp_nodelay,
             reconnect: None,
+            http2_adaptive_window: None,
+            http2_keep_alive_interval: None,
+            keep_alive_while_idle: None,
         }
     }
 
@@ -241,6 +330,15 @@ impl YellowstoneGrpcClientConfig {
         if let Some(reconnect) = self.reconnect.clone() {
             builder = builder.set_reconnect_config(reconnect);
         }
+        if let Some(val) = self.http2_adaptive_window {
+            builder = builder.http2_adaptive_window(val);
+        }
+        if let Some(val) = self.http2_keep_alive_interval {
+            builder = builder.http2_keep_alive_interval(val);
+        }
+        if let Some(val) = self.keep_alive_while_idle {
+            builder = builder.keep_alive_while_idle(val);
+        }
         Ok(builder)
     }
 }
@@ -259,11 +357,13 @@ impl Datasource for YellowstoneGrpcGeyserClient {
         let commitment = self.commitment;
         let account_filters = self.account_filters.clone();
         let transaction_filters = self.transaction_filters.clone();
+        let blocks_meta_filters = self.blocks_meta_filters.clone();
         let BlockFilters {
             filters,
             failed_transactions: block_failed_transactions,
         } = self.block_filters.clone();
         let retain_block_failed_transactions = block_failed_transactions.unwrap_or(true);
+        let tag = self.tag.clone().unwrap_or_else(|| DEFAULT_TAG.to_string());
 
         let builder = GeyserGrpcClient::build_from_shared(endpoint)
             .map_err(|err| carbon_core::error::Error::FailedToConsumeDatasource(err.to_string()))?
@@ -276,10 +376,23 @@ impl Datasource for YellowstoneGrpcGeyserClient {
             .map_err(|err| carbon_core::error::Error::FailedToConsumeDatasource(err.to_string()))?
             .connect()
             .await
-            .map_err(|err| carbon_core::error::Error::FailedToConsumeDatasource(err.to_string()))?;
+            .map_err(|err| {
+                log::error!("[{tag}] gRPC connect() failed: {err}");
+                carbon_core::error::Error::FailedToConsumeDatasource(err.to_string())
+            })?;
+
+        log::info!("[{tag}] gRPC channel connected");
+        tracing::info!(
+            component = yellowstone_ready_component(&tag),
+            server = tag.as_str(),
+            "indexer.connection.ready"
+        );
 
         let disconnect_tx_clone = self.disconnect_notifier.clone();
         let stream_timeout = self.stream_timeout;
+        let block_time_resolver = self.block_time_resolver.clone();
+        let block_meta_observer = self.block_meta_observer.clone();
+        let tx_timing_observer = self.transaction_timing_observer.clone();
 
         tokio::spawn(async move {
             let subscribe_request = SubscribeRequest {
@@ -289,7 +402,7 @@ impl Datasource for YellowstoneGrpcGeyserClient {
                 transactions_status: HashMap::new(),
                 entry: HashMap::new(),
                 blocks: filters,
-                blocks_meta: HashMap::new(),
+                blocks_meta: blocks_meta_filters,
                 commitment: commitment.map(|x| x as i32),
                 accounts_data_slice: vec![],
                 ping: None,
@@ -306,12 +419,18 @@ impl Datasource for YellowstoneGrpcGeyserClient {
             loop {
                 tokio::select! {
                     _ = cancellation_token.cancelled() => {
-                        log::info!("Cancelling Yellowstone gRPC subscription.");
+                        log::info!("[{tag}] Cancelling Yellowstone gRPC subscription.");
                         break;
                     }
-                    result = geyser_client.subscribe_with_request(Some(subscribe_request.clone())) => {
+                    result = subscribe_with_deadline(&mut geyser_client, &subscribe_request, &tag) => {
                         match result {
                             Ok((mut subscribe_tx, mut stream)) => {
+                                log::info!("[{tag}] Subscribe established");
+                                tracing::info!(
+                                    component = yellowstone_ready_component(&tag),
+                                    server = tag.as_str(),
+                                    "indexer.yellowstone.subscribe.ready"
+                                );
                                 reconnect_delay = Duration::from_millis(RECONNECT_INITIAL_DELAY_MS);
                                 let mut first_message_after_reconnect = last_disconnect_time.is_some();
 
@@ -328,20 +447,20 @@ impl Datasource for YellowstoneGrpcGeyserClient {
                                     let message = match message_result {
                                         Ok(Some(msg)) => msg,
                                         Ok(None) => {
-                                            log::warn!("Stream closed");
+                                            log::warn!("[{tag}] Stream closed");
                                             if last_disconnect_time.is_none() {
                                                 last_disconnect_time = Some(Utc::now());
                                                 last_slot_before_disconnect = Some(last_processed_slot);
-                                                log::warn!("Disconnected at slot {last_processed_slot}");
+                                                log::warn!("[{tag}] Disconnected at slot {last_processed_slot}");
                                             }
                                             break;
                                         }
                                         Err(_) => {
-                                            log::warn!("Stream timeout - no messages for {stream_timeout:?}");
+                                            log::warn!("[{tag}] Stream timeout - no messages for {stream_timeout:?}");
                                             if last_disconnect_time.is_none() {
                                                 last_disconnect_time = Some(Utc::now());
                                                 last_slot_before_disconnect = Some(last_processed_slot);
-                                                log::warn!("Disconnected at slot {last_processed_slot} (timeout)");
+                                                log::warn!("[{tag}] Disconnected at slot {last_processed_slot} (timeout)");
                                             }
                                             break;
                                         }
@@ -366,7 +485,7 @@ impl Datasource for YellowstoneGrpcGeyserClient {
                                                         let missed = slot.saturating_sub(last_slot);
 
                                                         let disconnection = DatasourceDisconnection {
-                                                            source: "yellowstone-grpc".to_string(),
+                                                            source: tag.clone(),
                                                             disconnect_time,
                                                             last_slot_before_disconnect: last_slot,
                                                             first_slot_after_reconnect: slot,
@@ -377,10 +496,12 @@ impl Datasource for YellowstoneGrpcGeyserClient {
                                                             let _ = tx.try_send(disconnection);
                                                         }
 
-                                                        log::info!("Reconnected. Slots: {last_slot} -> {slot} (missed: {missed})");
+                                                        log::info!("[{tag}] Reconnected. Slots: {last_slot} -> {slot} (missed: {missed})");
                                                     }
                                                 }
                                             }
+
+                                            let provider_created_at = msg.created_at.as_ref().map(|ts| ts.seconds);
 
                                             match msg.update_oneof {
                                             Some(UpdateOneof::Account(account_update)) => {
@@ -396,12 +517,20 @@ impl Datasource for YellowstoneGrpcGeyserClient {
 
                                             Some(UpdateOneof::Transaction(transaction_update)) => {
                                                 last_processed_slot = transaction_update.slot;
+                                                let block_time = block_time_resolver.as_ref().and_then(|resolve| resolve(transaction_update.slot));
+                                                if let Some(observer) = &tx_timing_observer {
+                                                    observer(&TransactionTiming {
+                                                        slot: transaction_update.slot,
+                                                        block_time,
+                                                        provider_created_at,
+                                                    });
+                                                }
                                                 send_subscribe_update_transaction_info(
                                                     transaction_update.transaction,
                                                     &sender,
                                                     id_for_loop.clone(),
                                                     transaction_update.slot,
-                                                    None,
+                                                    block_time,
                                                 )
                                                 .await
                                             }
@@ -411,6 +540,13 @@ impl Datasource for YellowstoneGrpcGeyserClient {
 
                                                 for transaction_update in block_update.transactions {
                                                     if retain_block_failed_transactions || transaction_update.meta.as_ref().map(|meta| meta.err.is_none()).unwrap_or(false) {
+                                                        if let Some(observer) = &tx_timing_observer {
+                                                            observer(&TransactionTiming {
+                                                                slot: block_update.slot,
+                                                                block_time,
+                                                                provider_created_at,
+                                                            });
+                                                        }
                                                         send_subscribe_update_transaction_info(Some(transaction_update), &sender, id_for_loop.clone(), block_update.slot, block_time).await
                                                     }
                                                 }
@@ -426,6 +562,14 @@ impl Datasource for YellowstoneGrpcGeyserClient {
                                                 }
                                             }
 
+                                            Some(UpdateOneof::BlockMeta(block_meta)) => {
+                                                last_processed_slot = block_meta.slot;
+                                                BLOCK_META_UPDATES_RECEIVED.inc();
+                                                if let Some(observer) = &block_meta_observer {
+                                                    observer(&block_meta, msg.created_at.as_ref());
+                                                }
+                                            }
+
                                             Some(UpdateOneof::Ping(_)) => {
                                                 // Sink replays the last request on reconnect.
                                                 match subscribe_tx
@@ -436,7 +580,7 @@ impl Datasource for YellowstoneGrpcGeyserClient {
                                                     .await {
                                                         Ok(()) => (),
                                                         Err(error) => {
-                                                            log::error!("Failed to send ping error: {error:?}");
+                                                            log::error!("[{tag}] Failed to send ping: {error:?}");
                                                             break;
                                                         },
                                                     }
@@ -446,12 +590,12 @@ impl Datasource for YellowstoneGrpcGeyserClient {
                                         }
                                         }
                                         Err(error) => {
-                                            log::error!("Geyser stream error: {error:?}");
+                                            log::error!("[{tag}] Geyser stream error: {error:?}");
 
                                             if last_disconnect_time.is_none() {
                                                 last_disconnect_time = Some(Utc::now());
                                                 last_slot_before_disconnect = Some(last_processed_slot);
-                                                log::error!("Disconnected at slot {last_processed_slot}");
+                                                log::error!("[{tag}] Disconnected at slot {last_processed_slot}");
                                             }
 
                                             break;
@@ -460,7 +604,7 @@ impl Datasource for YellowstoneGrpcGeyserClient {
                                 }
                             }
                             Err(e) => {
-                                log::error!("Failed to subscribe: {e:?}");
+                                log::error!("[{tag}] Failed to subscribe: {e:?}");
 
                                 if last_disconnect_time.is_none() {
                                     last_disconnect_time = Some(Utc::now());
@@ -469,7 +613,7 @@ impl Datasource for YellowstoneGrpcGeyserClient {
 
                                 tokio::select! {
                                     _ = cancellation_token.cancelled() => {
-                                        log::info!("Cancelling Yellowstone gRPC subscription.");
+                                        log::info!("[{tag}] Cancelling Yellowstone gRPC subscription.");
                                         break;
                                     }
                                     _ = tokio::time::sleep(reconnect_delay) => {}
@@ -488,11 +632,45 @@ impl Datasource for YellowstoneGrpcGeyserClient {
     }
 
     fn update_types(&self) -> Vec<UpdateType> {
-        vec![
-            UpdateType::AccountUpdate,
-            UpdateType::Transaction,
-            UpdateType::AccountDeletion,
-        ]
+        let has_block_filters = !self.block_filters.filters.is_empty();
+        let mut update_types = Vec::new();
+        if !self.account_filters.is_empty() || has_block_filters {
+            update_types.push(UpdateType::AccountUpdate);
+            update_types.push(UpdateType::AccountDeletion);
+        }
+        if !self.transaction_filters.is_empty() || has_block_filters {
+            update_types.push(UpdateType::Transaction);
+        }
+        update_types
+    }
+}
+
+async fn subscribe_with_deadline(
+    geyser_client: &mut GeyserGrpcClient,
+    subscribe_request: &SubscribeRequest,
+    tag: &str,
+) -> GeyserGrpcClientResult<(SubscribeRequestSink, GeyserStream)> {
+    tokio::time::timeout(
+        SUBSCRIBE_DEADLINE,
+        geyser_client.subscribe_with_request(Some(subscribe_request.clone())),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        log::error!("[{tag}] subscribe_with_request hung for {SUBSCRIBE_DEADLINE:?}, retrying");
+        Err(GeyserGrpcClientError::TonicStatus(
+            Status::deadline_exceeded(format!(
+                "subscribe_with_request timed out after {SUBSCRIBE_DEADLINE:?}"
+            )),
+        ))
+    })
+}
+
+// Downstream readiness probes key on this component name.
+fn yellowstone_ready_component(tag: &str) -> &'static str {
+    if tag.contains("processed-blockhash") {
+        "yellowstone_processed_blockhash"
+    } else {
+        "yellowstone_confirmed"
     }
 }
 

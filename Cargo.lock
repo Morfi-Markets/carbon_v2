@@ -2812,6 +2812,7 @@ dependencies = [
  "solana-signature",
  "tokio",
  "tokio-util",
+ "tracing",
  "yellowstone-grpc-client",
  "yellowstone-grpc-proto",
 ]
